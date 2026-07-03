@@ -1,0 +1,68 @@
+Fix two bugs in @tmustier/pi-agent-teams (v0.1.2):
+
+1. Windows: worker subprocess spawn ENOENT
+   teammate-rpc.ts -> add shell: process.platform === "win32"
+
+2. Worker stalls after first task — second task never triggers agent_start
+   worker.ts -> agent_end no longer calls sendUserMessage inside event handler;
+   dequeued to poll loop which calls maybeStartNextWork() from outside any handler.
+
+diff --git a/extensions/teams/teammate-rpc.ts b/extensions/teams/teammate-rpc.ts
+index 0000000..0000000 100644
+--- a/extensions/teams/teammate-rpc.ts
++++ b/extensions/teams/teammate-rpc.ts
+@@ -132,6 +132,7 @@
+ 			cwd: opts.cwd,
+ 			env: { ...process.env, ...opts.env },
+ 			stdio: ["pipe", "pipe", "pipe"],
++			shell: process.platform === "win32",
+ 		});
+ 
+ 		this.proc.on("error", (err) => {
+diff --git a/extensions/teams/worker.ts b/extensions/teams/worker.ts
+index 0000000..0000000 100644
+--- a/extensions/teams/worker.ts
++++ b/extensions/teams/worker.ts
+@@ -209,6 +209,10 @@
+ 	/** Tools that were active before plan-mode restriction, so we can restore them on approval. */
+ 	let prePlanTools: string[] | null = null;
+ 
++	// Track last completed task so the poll loop can send idle notification
++	// after maybeStartNextWork finds nothing.  Set by agent_end, consumed by poll.
++	let _lastCompleted: Record<string, unknown> | null = null;
++
+ 	const poll = async () => {
+ 		while (!pollAbort) {
+ 			try {
+@@ -352,6 +356,14 @@
+ 				}
+ 
+ 				if (!shutdownInProgress) await maybeStartNextWork();
++
++				// If a task just completed and no new work was started,
++				// notify the leader (_lastCompleted is set by agent_end).
++				if (_lastCompleted && !isStreaming && !currentTaskId) {
++					const info = _lastCompleted;
++					_lastCompleted = null;
++					await sendIdleNotification(info.completedTaskId, info.completedStatus, info.failureReason);
++				}
+ 			} catch {
+ 				// ignore polling errors
+ 			}
+@@ -598,12 +610,10 @@
+ 			abortRequestId = null;
+ 		}
+ 
+-		await maybeStartNextWork();
+-
+-		// Only tell the leader we're idle if we truly didn't start more work.
+-		if (!isStreaming && !currentTaskId) {
+-			await sendIdleNotification(completedTaskId, completedStatus, failureReason);
+-		}
++		// Don't call maybeStartNextWork() from inside agent_end.
++		// sendUserMessage inside event handlers can fail to trigger
++		// agent_start.  The poll loop runs ~500ms and will retry.
++		_lastCompleted = { completedTaskId, completedStatus, failureReason };
+ 	});
+ 
+ 	// Best-effort cleanup on SIGTERM (leader kill).
